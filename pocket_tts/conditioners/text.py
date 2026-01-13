@@ -1,4 +1,6 @@
 import logging
+import os
+from functools import lru_cache
 
 import sentencepiece
 import torch
@@ -30,9 +32,16 @@ class SentencePieceTokenizer:
         assert nbins == self.sp.vocab_size(), (
             f"sentencepiece tokenizer has vocab size={self.sp.vocab_size()} but nbins={nbins} was specified"
         )
+        cache_size = int(os.environ.get("POCKET_TTS_TOKENIZER_CACHE_SIZE", "128"))
+        self._encode_cached = self._encode_uncached
+        if cache_size > 0:
+            self._encode_cached = lru_cache(maxsize=cache_size)(self._encode_uncached)
+
+    def _encode_uncached(self, text: str) -> torch.Tensor:
+        return torch.tensor(self.sp.encode(text, out_type=int))[None, :]
 
     def __call__(self, text: str) -> TokenizedText:
-        return TokenizedText(torch.tensor(self.sp.encode(text, out_type=int))[None, :])
+        return TokenizedText(self._encode_cached(text))
 
 
 class LUTConditioner(BaseConditioner):

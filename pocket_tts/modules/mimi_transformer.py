@@ -80,7 +80,9 @@ class MimiStreamingMultiheadAttention(StatefulModule):
 
         state = {}
         state["offset"] = torch.zeros(batch_size, dtype=torch.long)
-        state["cache"] = torch.zeros((2, batch_size, self.num_heads, sequence_length, dim_per_head))
+        state["cache"] = torch.empty(
+            (2, batch_size, self.num_heads, sequence_length, dim_per_head)
+        )
         state["end_offset"] = torch.zeros(batch_size, dtype=torch.long)
         return state
 

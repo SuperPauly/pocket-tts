@@ -6,7 +6,7 @@ from torch import nn
 
 def init_states(
     model: nn.Module, batch_size: int, sequence_length: int
-) -> dict[str, dict[str, torch.Tensor]]:
+) -> dict[str, dict[str, torch.Tensor | int]]:
     result = {}
     for module_name, module in model.named_modules():
         if not isinstance(module, StatefulModule):
@@ -18,7 +18,7 @@ def init_states(
 
 
 def increment_steps(
-    module: nn.Module, model_state: dict[str, dict[str, torch.Tensor]], increment: int = 1
+    module: nn.Module, model_state: dict[str, dict[str, torch.Tensor | int]], increment: int = 1
 ):
     # print("incrementing steps by", increment)
     for module_name, module in module.named_modules():
@@ -40,6 +40,8 @@ class StatefulModule(ABC, nn.Module):
     def increment_step(self, state: dict, increment: int = 1):
         pass
 
-    def get_state(self, model_state: dict[str, dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    def get_state(
+        self, model_state: dict[str, dict[str, torch.Tensor | int]]
+    ) -> dict[str, torch.Tensor | int]:
         """Get the state for this module from the model state."""
         return model_state[self._module_absolute_name]

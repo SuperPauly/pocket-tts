@@ -1,4 +1,3 @@
-import copy
 import logging
 import os
 import queue
@@ -20,6 +19,8 @@ from pocket_tts.data.audio_utils import convert_audio
 from pocket_tts.default_parameters import (
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_LSD_DECODE_STEPS,
+    DEFAULT_MAX_TEXT_LENGTH,
+    DEFAULT_MIMI_STATE_SEQUENCE_LENGTH,
     DEFAULT_NOISE_CLAMP,
     DEFAULT_TEMPERATURE,
     DEFAULT_VARIANT,
@@ -40,7 +41,10 @@ from pocket_tts.utils.utils import (
 )
 from pocket_tts.utils.weights_loading import get_flow_lm_state_dict, get_mimi_state_dict
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +64,7 @@ class TTSModel(nn.Module):
         self.lsd_decode_steps = lsd_decode_steps
         self.noise_clamp = noise_clamp
         self.eos_threshold = eos_threshold
+        self._decode_log_every = int(os.getenv("POCKET_TTS_DECODE_LOG_EVERY", "0"))
         self.config = config
         self.has_voice_cloning = True
 
@@ -201,7 +206,32 @@ class TTSModel(nn.Module):
         tts_model = TTSModel._from_pydantic_config_with_weights(
             config, temp, lsd_decode_steps, noise_clamp, eos_threshold
         )
+        if os.environ.get("POCKET_TTS_DISABLE_COMPILE", "0") != "1":
+            try:
+                tts_model.flow_lm = torch.compile(
+                    tts_model.flow_lm, mode="reduce-overhead"
+                )
+            except Exception:
+                logger.exception("Failed to torch.compile FlowLM; continuing without it.")
+        if os.environ.get("POCKET_TTS_QUANTIZE_FLOW_LM", "0") == "1":
+            tts_model.flow_lm = torch.ao.quantization.quantize_dynamic(
+                tts_model.flow_lm, {nn.Linear}, dtype=torch.qint8
+            )
         return tts_model
+
+    def _clone_state(self, model_state: dict) -> dict:
+        return {
+            module_name: {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in state.items()
+            }
+            for module_name, state in model_state.items()
+        }
+
+    def _estimate_audio_samples(self, text: str) -> int:
+        words = len(text.split())
+        estimated_seconds = words * 0.5 + 1.0
+        return int(estimated_seconds * self.sample_rate)
 
     def _run_flow_lm_and_increment_step(
         self,
@@ -241,7 +271,11 @@ class TTSModel(nn.Module):
         backbone_input_latents: torch.Tensor,
         audio_conditioning: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        text_embeddings = self.flow_lm.conditioner(TokenizedText(text_tokens))
+        tokenized = TokenizedText.acquire(text_tokens)
+        try:
+            text_embeddings = self.flow_lm.conditioner(tokenized)
+        finally:
+            TokenizedText.release(tokenized)
         text_embeddings = torch.cat([text_embeddings, audio_conditioning], dim=1)
 
         output_embeddings, is_eos = self.flow_lm._sample_next_latent(
@@ -261,32 +295,39 @@ class TTSModel(nn.Module):
         conditioning = F.linear(latents, self.flow_lm.speaker_proj_weight)
         return conditioning
 
-    @torch.no_grad
+    @torch.inference_mode()
     def _decode_audio_worker(self, latents_queue: queue.Queue, result_queue: queue.Queue):
         """Worker thread function for decoding audio latents from queue with immediate streaming."""
         try:
-            audio_chunks = []
-            mimi_state = init_states(self.mimi, batch_size=1, sequence_length=1000)
+            mimi_state = init_states(
+                self.mimi, batch_size=1, sequence_length=DEFAULT_MIMI_STATE_SEQUENCE_LENGTH
+            )
+            chunk_index = 0
+            log_decode = self._decode_log_every > 0 and logger.isEnabledFor(logging.DEBUG)
             while True:
                 latent = latents_queue.get()
                 if latent is None:
                     break
-                mimi_decoding_input = latent * self.flow_lm.emb_std + self.flow_lm.emb_mean
-                transposed = mimi_decoding_input.transpose(-1, -2)
+                if self._should_skip_latent(latent):
+                    latents_queue.task_done()
+                    continue
+                mimi_decoding_input = torch.addcmul(
+                    self.flow_lm.emb_mean, latent, self.flow_lm.emb_std
+                )
+                transposed = mimi_decoding_input.transpose(-1, -2).contiguous()
                 quantized = self.mimi.quantizer(transposed)
 
                 t = time.monotonic()
                 audio_frame = self.mimi.decode_from_latent(quantized, mimi_state)
                 increment_steps(self.mimi, mimi_state, increment=16)
                 audio_frame_duration = audio_frame.shape[2] / self.config.mimi.sample_rate
-                # We could log the timings here.
-                logger.debug(
-                    " " * 30 + "Decoded %d ms of audio with mimi in %d ms",
-                    int(audio_frame_duration * 1000),
-                    int((time.monotonic() - t) * 1000),
-                )
-                audio_chunks.append(audio_frame)
-
+                if log_decode and (chunk_index % self._decode_log_every == 0):
+                    logger.debug(
+                        " " * 30 + "Decoded %d ms of audio with mimi in %d ms",
+                        int(audio_frame_duration * 1000),
+                        int((time.monotonic() - t) * 1000),
+                    )
+                chunk_index += 1
                 result_queue.put(("chunk", audio_frame))
 
                 latents_queue.task_done()
@@ -298,7 +339,11 @@ class TTSModel(nn.Module):
             # Put error in result queue
             result_queue.put(("error", e))
 
-    @torch.no_grad
+    @staticmethod
+    def _should_skip_latent(latent: torch.Tensor) -> bool:
+        return latent.numel() == 0
+
+    @torch.inference_mode()
     def generate_audio(
         self,
         model_state: dict,
@@ -339,17 +384,36 @@ class TTSModel(nn.Module):
             ValueError: If text_to_generate is empty or invalid.
             RuntimeError: If generation fails due to model errors.
         """
-        audio_chunks = []
+        estimated_samples = max(1, self._estimate_audio_samples(text_to_generate))
+        audio_buffer = None
+        current_offset = 0
         for chunk in self.generate_audio_stream(
             model_state=model_state,
             text_to_generate=text_to_generate,
             frames_after_eos=frames_after_eos,
             copy_state=copy_state,
         ):
-            audio_chunks.append(chunk)
-        return torch.cat(audio_chunks, dim=0)
+            if audio_buffer is None:
+                audio_buffer = torch.empty(
+                    (estimated_samples,),
+                    dtype=chunk.dtype,
+                    device=chunk.device,
+                )
+            new_size = current_offset + chunk.shape[0]
+            if new_size > audio_buffer.shape[0]:
+                resized = torch.empty(
+                    (max(audio_buffer.shape[0] * 2, new_size),),
+                    dtype=chunk.dtype,
+                    device=chunk.device,
+                )
+                resized[:current_offset] = audio_buffer[:current_offset]
+                audio_buffer = resized
+            audio_buffer[current_offset:new_size] = chunk
+            current_offset = new_size
+        if audio_buffer is None:
+            return torch.empty((0,), device=self.device)
+        return audio_buffer[:current_offset]
 
-    @torch.no_grad
     def generate_audio_stream(
         self,
         model_state: dict,
@@ -400,82 +464,83 @@ class TTSModel(nn.Module):
         # as conditioning for the next chunk.
         chunks = split_into_best_sentences(self.flow_lm.conditioner.tokenizer, text_to_generate)
 
-        for chunk in chunks:
-            text_to_generate, frames_after_eos_guess = prepare_text_prompt(chunk)
-            frames_after_eos_guess += 2
-            yield from self._generate_audio_stream_short_text(
-                model_state=model_state,
-                text_to_generate=chunk,
-                frames_after_eos=frames_after_eos_guess,
-                copy_state=copy_state,
-            )
+        with torch.inference_mode():
+            for chunk in chunks:
+                text_to_generate, frames_after_eos_guess = prepare_text_prompt(chunk)
+                frames_after_eos_guess += 2
+                yield from self._generate_audio_stream_short_text(
+                    model_state=model_state,
+                    text_to_generate=chunk,
+                    frames_after_eos=frames_after_eos_guess,
+                    copy_state=copy_state,
+                )
 
-    @torch.no_grad
     def _generate_audio_stream_short_text(
         self, model_state: dict, text_to_generate: str, frames_after_eos: int, copy_state: bool
     ):
-        if copy_state:
-            model_state = copy.deepcopy(model_state)
+        with torch.inference_mode():
+            if copy_state:
+                model_state = self._clone_state(model_state)
 
-        # Set up multithreaded generation and decoding
-        latents_queue = queue.Queue()
-        result_queue = queue.Queue()
+            # Set up multithreaded generation and decoding
+            latents_queue = queue.Queue(maxsize=2)
+            result_queue = queue.Queue()
 
         # Start decoder worker thread
-        decoder_thread = threading.Thread(
-            target=self._decode_audio_worker, args=(latents_queue, result_queue), daemon=True
-        )
-        logger.info("starting timer now!")
-        t_generating = time.monotonic()
-        decoder_thread.start()
+            decoder_thread = threading.Thread(
+                target=self._decode_audio_worker, args=(latents_queue, result_queue), daemon=True
+            )
+            logger.info("starting timer now!")
+            t_generating = time.monotonic()
+            decoder_thread.start()
 
         # Generate latents and add them to queue (decoder processes them in parallel)
-        self._generate(
-            model_state=model_state,
-            text_to_generate=text_to_generate,
-            frames_after_eos=frames_after_eos,
-            latents_queue=latents_queue,
-            result_queue=result_queue,
-        )
+            self._generate(
+                model_state=model_state,
+                text_to_generate=text_to_generate,
+                frames_after_eos=frames_after_eos,
+                latents_queue=latents_queue,
+                result_queue=result_queue,
+            )
 
         # Stream audio chunks as they become available
-        total_generated_samples = 0
-        while True:
-            result = result_queue.get()
-            if result[0] == "chunk":
-                # Audio chunk available immediately for streaming/playback
-                audio_chunk = result[1]
-                total_generated_samples += audio_chunk.shape[-1]
-                yield audio_chunk[0, 0]  # Remove batch, channel
-            elif result[0] == "done":
-                # Generation complete
-                break
-            elif result[0] == "error":
-                # Wait for decoder thread to finish cleanly before propagating error
-                with display_execution_time("Waiting for mimi decoder to finish"):
-                    decoder_thread.join()
-                # Propagate error
-                raise result[1]
+            total_generated_samples = 0
+            while True:
+                result = result_queue.get()
+                if result[0] == "chunk":
+                    # Audio chunk available immediately for streaming/playback
+                    audio_chunk = result[1]
+                    total_generated_samples += audio_chunk.shape[-1]
+                    yield audio_chunk[0, 0]  # Remove batch, channel
+                elif result[0] == "done":
+                    # Generation complete
+                    break
+                elif result[0] == "error":
+                    # Wait for decoder thread to finish cleanly before propagating error
+                    with display_execution_time("Waiting for mimi decoder to finish"):
+                        decoder_thread.join()
+                    # Propagate error
+                    raise result[1]
 
         # Wait for decoder thread to finish cleanly
-        with display_execution_time("Waiting for mimi decoder to finish"):
-            decoder_thread.join()
+            with display_execution_time("Waiting for mimi decoder to finish"):
+                decoder_thread.join()
 
         # Print timing information
-        duration_generated_audio = int(
-            total_generated_samples * 1000 / self.config.mimi.sample_rate
-        )
-        generation_time = int((time.monotonic() - t_generating) * 1000)
-        real_time_factor = duration_generated_audio / generation_time
+            duration_generated_audio = int(
+                total_generated_samples * 1000 / self.config.mimi.sample_rate
+            )
+            generation_time = int((time.monotonic() - t_generating) * 1000)
+            real_time_factor = duration_generated_audio / generation_time
 
-        logger.info(
-            "Generated: %d ms of audio in %d ms so %.2fx faster than real-time",
-            duration_generated_audio,
-            generation_time,
-            real_time_factor,
-        )
+            logger.info(
+                "Generated: %d ms of audio in %d ms so %.2fx faster than real-time",
+                duration_generated_audio,
+                generation_time,
+                real_time_factor,
+            )
 
-    @torch.no_grad
+    @torch.inference_mode()
     def _generate(
         self,
         model_state: dict,
@@ -484,7 +549,7 @@ class TTSModel(nn.Module):
         latents_queue: queue.Queue,
         result_queue: queue.Queue,
     ):
-        gen_len_sec = len(text_to_generate.split()) * 1 + 2.0
+        gen_len_sec = len(text_to_generate.split()) * 0.5 + 1.0
         max_gen_len = int(gen_len_sec * 12.5)
         prepared = self.flow_lm.conditioner.prepare(text_to_generate)
 
@@ -510,7 +575,7 @@ class TTSModel(nn.Module):
         generation_thread = threading.Thread(target=run_generation, daemon=True)
         generation_thread.start()
 
-    @torch.no_grad
+    @torch.inference_mode()
     def _autoregressive_generation(
         self, model_state: dict, max_gen_len: int, frames_after_eos: int, latents_queue: queue.Queue
     ):
@@ -547,13 +612,13 @@ class TTSModel(nn.Module):
         latents_queue.put(None)
         logger.info("Average generation step time: %d ms", int(statistics.mean(steps_times)))
 
-    @lru_cache(maxsize=2)
+    @lru_cache(maxsize=1)
     def _cached_get_state_for_audio_prompt(
         self, audio_conditioning: Path | str | torch.Tensor, truncate: bool = False
     ) -> dict:
         return self.get_state_for_audio_prompt(audio_conditioning, truncate)
 
-    @torch.no_grad
+    @torch.inference_mode()
     def get_state_for_audio_prompt(
         self, audio_conditioning: Path | str | torch.Tensor, truncate: bool = False
     ) -> dict:
@@ -621,6 +686,9 @@ class TTSModel(nn.Module):
 
             with display_execution_time("Encoding audio prompt"):
                 prompt = self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
+                del audio_conditioning
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 # import safetensors.torch
                 # safetensors.torch.save_file(
                 #     {"audio_prompt": prompt},
@@ -639,6 +707,11 @@ def prepare_text_prompt(text: str) -> tuple[str, int]:
     text = text.strip()
     if text == "":
         raise ValueError("Text prompt cannot be empty")
+    max_text_length = int(os.environ.get("POCKET_TTS_MAX_TEXT_LENGTH", DEFAULT_MAX_TEXT_LENGTH))
+    if len(text) > max_text_length:
+        raise ValueError(
+            f"Text prompt length {len(text)} exceeds the maximum of {max_text_length} characters."
+        )
     text = text.replace("\n", " ").replace("\r", " ").replace("  ", " ")
     number_of_words = len(text.split())
     if number_of_words <= 4:
