@@ -163,6 +163,11 @@ class TTSModel(nn.Module):
             logger.warning(
                 "No weights_path specified for FlowLM or TTSModel, model is uninitialized!"
             )
+        flow_dtype = getattr(torch, config.flow_lm.dtype)
+        mimi_dtype = getattr(torch, config.mimi.dtype)
+        tts_model.flow_lm = tts_model.flow_lm.to(dtype=flow_dtype)
+        tts_model.mimi = tts_model.mimi.to(dtype=mimi_dtype)
+
         size_in_mb = size_of_dict(tts_model.state_dict()) // 1e6
         logging.info(f"TTS Model loaded successfully. Its size is {size_in_mb} MB")
 
@@ -208,9 +213,7 @@ class TTSModel(nn.Module):
         )
         if os.environ.get("POCKET_TTS_DISABLE_COMPILE", "0") != "1":
             try:
-                tts_model.flow_lm = torch.compile(
-                    tts_model.flow_lm, mode="reduce-overhead"
-                )
+                tts_model.flow_lm = torch.compile(tts_model.flow_lm, mode="reduce-overhead")
             except Exception:
                 logger.exception("Failed to torch.compile FlowLM; continuing without it.")
         if os.environ.get("POCKET_TTS_QUANTIZE_FLOW_LM", "0") == "1":
@@ -276,6 +279,7 @@ class TTSModel(nn.Module):
             text_embeddings = self.flow_lm.conditioner(tokenized)
         finally:
             TokenizedText.release(tokenized)
+        audio_conditioning = audio_conditioning.to(text_embeddings.dtype)
         text_embeddings = torch.cat([text_embeddings, audio_conditioning], dim=1)
 
         output_embeddings, is_eos = self.flow_lm._sample_next_latent(
@@ -290,10 +294,11 @@ class TTSModel(nn.Module):
         return output_embeddings[:, None, :], is_eos
 
     def _encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
+        audio = audio.to(next(self.mimi.parameters()).dtype)
         encoded = self.mimi.encode_to_latent(audio)
-        latents = encoded.transpose(-1, -2).to(torch.float32)
+        latents = encoded.transpose(-1, -2).to(self.flow_lm.speaker_proj_weight.dtype)
         conditioning = F.linear(latents, self.flow_lm.speaker_proj_weight)
-        return conditioning
+        return conditioning.to(self.flow_lm.dtype)
 
     @torch.inference_mode()
     def _decode_audio_worker(self, latents_queue: queue.Queue, result_queue: queue.Queue):
@@ -395,9 +400,7 @@ class TTSModel(nn.Module):
         ):
             if audio_buffer is None:
                 audio_buffer = torch.empty(
-                    (estimated_samples,),
-                    dtype=chunk.dtype,
-                    device=chunk.device,
+                    (estimated_samples,), dtype=chunk.dtype, device=chunk.device
                 )
             new_size = current_offset + chunk.shape[0]
             if new_size > audio_buffer.shape[0]:
@@ -486,7 +489,7 @@ class TTSModel(nn.Module):
             latents_queue = queue.Queue(maxsize=2)
             result_queue = queue.Queue()
 
-        # Start decoder worker thread
+            # Start decoder worker thread
             decoder_thread = threading.Thread(
                 target=self._decode_audio_worker, args=(latents_queue, result_queue), daemon=True
             )
@@ -494,7 +497,7 @@ class TTSModel(nn.Module):
             t_generating = time.monotonic()
             decoder_thread.start()
 
-        # Generate latents and add them to queue (decoder processes them in parallel)
+            # Generate latents and add them to queue (decoder processes them in parallel)
             self._generate(
                 model_state=model_state,
                 text_to_generate=text_to_generate,
@@ -503,7 +506,7 @@ class TTSModel(nn.Module):
                 result_queue=result_queue,
             )
 
-        # Stream audio chunks as they become available
+            # Stream audio chunks as they become available
             total_generated_samples = 0
             while True:
                 result = result_queue.get()
@@ -522,11 +525,11 @@ class TTSModel(nn.Module):
                     # Propagate error
                     raise result[1]
 
-        # Wait for decoder thread to finish cleanly
+            # Wait for decoder thread to finish cleanly
             with display_execution_time("Waiting for mimi decoder to finish"):
                 decoder_thread.join()
 
-        # Print timing information
+            # Print timing information
             duration_generated_audio = int(
                 total_generated_samples * 1000 / self.config.mimi.sample_rate
             )
@@ -660,13 +663,11 @@ class TTSModel(nn.Module):
             prompt = load_predefined_voice(audio_conditioning)
         else:
             if not self.has_voice_cloning and isinstance(audio_conditioning, (str, Path)):
-                raise ValueError(
-                    f"We could not download the weights for the model with voice cloning, "
-                    f"but you're trying to use voice cloning. "
-                    f"Without voice cloning, you can use our catalog of voices {list(PREDEFINED_VOICES)}. "
-                    f"If you want access to the model with voice cloning, go to "
-                    f"https://huggingface.co/kyutai/pocket-tts and accept the terms, "
-                    f"then make sure you're logged in locally with `uvx hf auth login`."
+                logger.warning(
+                    "Voice-cloning weights were unavailable, but a custom audio prompt was "
+                    "requested. Proceeding with the available weights; for better results, "
+                    "accept the terms at https://huggingface.co/kyutai/pocket-tts and log in "
+                    "locally with `uvx hf auth login`."
                 )
             if isinstance(audio_conditioning, str):
                 audio_conditioning = download_if_necessary(audio_conditioning)

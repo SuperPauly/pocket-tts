@@ -19,6 +19,12 @@ class TokenizedText:
     def __init__(self, tokens: torch.Tensor) -> None:
         self.tokens = tokens
 
+    def __getitem__(self, item: int) -> torch.Tensor:
+        return self.tokens[item]
+
+    def __len__(self) -> int:
+        return len(self.tokens)
+
     @classmethod
     def acquire(cls, tokens: torch.Tensor) -> "TokenizedText":
         if cls._pool:

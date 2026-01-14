@@ -4,7 +4,7 @@ weights_path: hf://kyutai/pocket-tts/tts_b6369a24.safetensors
 weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/tts_b6369a24.safetensors
 
 flow_lm:
-  dtype: float16
+  dtype: float32
   flow:
     depth: 6
     dim: 512
@@ -22,7 +22,7 @@ flow_lm:
   #weights_path: flow_lm_b6369a24.safetensors
 
 mimi:
-  dtype: float16
+  dtype: float32
   sample_rate: 24000
   channels: 1
   frame_rate: 12.5

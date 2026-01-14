@@ -9,7 +9,6 @@ from pocket_tts.modules.stateful_module import StatefulModule
 def complete_kv(
     cache: torch.Tensor, current_end: int, k: torch.Tensor, v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-
     cache[0, :, current_end : current_end + k.shape[1]] = k
     cache[1, :, current_end : current_end + v.shape[1]] = v
     valid = cache[:, :, : current_end + k.shape[1]]
@@ -61,9 +60,7 @@ class StreamingMultiheadAttention(StatefulModule):
     def _get_mask(self, shape: tuple[int, int], shift: int, device: torch.device) -> torch.Tensor:
         return _materialize_causal_mask(shape, shift=shift, device=device)
 
-    def init_state(
-        self, batch_size: int, sequence_length: int
-    ) -> dict[str, torch.Tensor | int]:
+    def init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor | int]:
         dim_per_head = self.embed_dim // self.num_heads
         return dict(
             current_end=0,

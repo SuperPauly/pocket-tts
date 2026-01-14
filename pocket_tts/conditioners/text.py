@@ -62,9 +62,9 @@ class LUTConditioner(BaseConditioner):
 
     def prepare(self, x: str) -> TokenizedText:
         tokens = self.tokenizer(x)
-        tokens = tokens[0].to(self.embed.weight.device)
+        tokens = tokens.tokens.to(self.embed.weight.device)
         return TokenizedText(tokens)
 
     def _get_condition(self, inputs: TokenizedText) -> torch.Tensor:
-        embeds = self.embed(inputs[0])
+        embeds = self.embed(inputs.tokens)
         return embeds

@@ -75,10 +75,7 @@ class RotaryEmbedding(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor | int):
         """Apply rope rotation to query or key tensor."""
         d = q.shape[-1]
-        if (
-            self._cached_freqs.numel() != d // 2
-            or self._cached_freqs.device != q.device
-        ):
+        if self._cached_freqs.numel() != d // 2 or self._cached_freqs.device != q.device:
             ds = torch.arange(d // 2, device=q.device, dtype=torch.float32)
             freqs = torch.exp(ds * (-math.log(self.max_period) * 2 / d))
             self._cached_freqs = freqs
