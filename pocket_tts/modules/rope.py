@@ -9,6 +9,7 @@ def apply_rope(
     k: torch.Tensor,
     offset: int | torch.Tensor = 0,
     max_period: int | float = 10_000,
+    freqs: torch.Tensor | None = None,
 ):
     """
     Args:
@@ -25,8 +26,9 @@ def apply_rope(
     assert D % 2 == 0
     assert max_period > 0
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    if freqs is None:
+        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
+        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
 
     # could be optimized in one call
     ts = torch.arange(T, device=q.device, dtype=torch.float32)
@@ -68,7 +70,13 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, max_period: float | int = 10000.0):
         super().__init__()
         self.max_period = max_period
+        self.register_buffer("_cached_freqs", torch.empty(0), persistent=False)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor | int):
         """Apply rope rotation to query or key tensor."""
-        return apply_rope(q, k, offset, self.max_period)
+        d = q.shape[-1]
+        if self._cached_freqs.numel() != d // 2 or self._cached_freqs.device != q.device:
+            ds = torch.arange(d // 2, device=q.device, dtype=torch.float32)
+            freqs = torch.exp(ds * (-math.log(self.max_period) * 2 / d))
+            self._cached_freqs = freqs
+        return apply_rope(q, k, offset, self.max_period, freqs=self._cached_freqs)

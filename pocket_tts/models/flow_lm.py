@@ -84,6 +84,11 @@ class FlowLMModel(nn.Module):
         self.transformer = transformer
         self.out_norm = nn.LayerNorm(dim, eps=1e-5)
         self.out_eos = nn.Linear(dim, 1, dtype=dtype)
+        if dtype is not None:
+            self.conditioner = self.conditioner.to(dtype=dtype)
+            self.flow_net = self.flow_net.to(dtype=dtype)
+            self.transformer = self.transformer.to(dtype=dtype)
+            self.out_norm = self.out_norm.to(dtype=dtype)
 
     @property
     def device(self) -> str:
@@ -114,15 +119,17 @@ class FlowLMModel(nn.Module):
             otherwise it is the reconstructed latent.
         """
         # NaN values signal a BOS position.
+        sequence = sequence.to(self.input_linear.weight.dtype)
         sequence = torch.where(torch.isnan(sequence), self.bos_emb, sequence)
         input_ = self.input_linear(sequence)
 
         transformer_out = self.backbone(input_, text_embeddings, sequence, model_state=model_state)
-        transformer_out = transformer_out.to(torch.float32)
+        flow_dtype = next(self.flow_net.parameters()).dtype
+        transformer_out = transformer_out.to(flow_dtype)
         assert lsd_decode_steps > 0
 
         transformer_out = transformer_out[:, -1]
-        out_eos = self.out_eos(transformer_out) > eos_threshold
+        out_eos = self.out_eos(transformer_out.to(self.out_eos.weight.dtype)) > eos_threshold
 
         noise_shape = transformer_out.shape[:-1] + (self.ldim,)
         std = temp**0.5
@@ -143,6 +150,7 @@ class FlowLMModel(nn.Module):
         # print("text_embeddings shape:", text_embeddings.shape)
         # if text_embeddings.numel() != 0:
         #     torch.save(text_embeddings, "debug_flow_lm_text_embeddings.pt")
+        text_embeddings = text_embeddings.to(input_.dtype)
         input_ = torch.cat([text_embeddings, input_], dim=1)
         # transformer_out = self.transformer(input_, model_state=model_state)
         transformer_out = self.transformer(input_, model_state)

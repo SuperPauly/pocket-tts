@@ -1,5 +1,5 @@
 import logging
-from typing import Generic, NamedTuple, TypeVar
+from typing import ClassVar, Generic, TypeVar
 
 import torch
 from torch import nn
@@ -10,8 +10,33 @@ logger = logging.getLogger(__name__)
 Prepared = TypeVar("Prepared")  # represents the prepared condition input type.
 
 
-class TokenizedText(NamedTuple):
-    tokens: torch.Tensor  # should be long tensor.
+class TokenizedText:
+    tokens: torch.Tensor
+
+    _pool: ClassVar[list["TokenizedText"]] = []
+    _pool_max: ClassVar[int] = 32
+
+    def __init__(self, tokens: torch.Tensor) -> None:
+        self.tokens = tokens
+
+    def __getitem__(self, item: int) -> torch.Tensor:
+        return self.tokens[item]
+
+    def __len__(self) -> int:
+        return len(self.tokens)
+
+    @classmethod
+    def acquire(cls, tokens: torch.Tensor) -> "TokenizedText":
+        if cls._pool:
+            instance = cls._pool.pop()
+            instance.tokens = tokens
+            return instance
+        return cls(tokens)
+
+    @classmethod
+    def release(cls, instance: "TokenizedText") -> None:
+        if len(cls._pool) < cls._pool_max:
+            cls._pool.append(instance)
 
 
 class BaseConditioner(nn.Module, Generic[Prepared]):

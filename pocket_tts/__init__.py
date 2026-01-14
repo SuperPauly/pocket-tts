@@ -1,7 +1,10 @@
+import os
+
 from beartype import BeartypeConf
 from beartype.claw import beartype_this_package
 
-beartype_this_package(conf=BeartypeConf(is_color=False))
+if os.environ.get("BEARTYPE_IS_PICKY", "1") != "0":
+    beartype_this_package(conf=BeartypeConf(is_color=False))
 
 from pocket_tts.models.tts_model import TTSModel  # noqa: E402
 

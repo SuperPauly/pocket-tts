@@ -7,10 +7,8 @@ from pocket_tts.modules.stateful_module import StatefulModule
 
 
 def complete_kv(
-    cache: torch.Tensor, current_end: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    cache: torch.Tensor, current_end: int, k: torch.Tensor, v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    current_end = current_end.shape[0]
-
     cache[0, :, current_end : current_end + k.shape[1]] = k
     cache[1, :, current_end : current_end + v.shape[1]] = v
     valid = cache[:, :, : current_end + k.shape[1]]
@@ -62,22 +60,19 @@ class StreamingMultiheadAttention(StatefulModule):
     def _get_mask(self, shape: tuple[int, int], shift: int, device: torch.device) -> torch.Tensor:
         return _materialize_causal_mask(shape, shift=shift, device=device)
 
-    def init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
+    def init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor | int]:
         dim_per_head = self.embed_dim // self.num_heads
-        initial_current_end = torch.zeros((0,)).to(self.in_proj.weight.device)
         return dict(
-            current_end=initial_current_end,
-            cache=torch.full(
+            current_end=0,
+            cache=torch.empty(
                 (2, batch_size, sequence_length, self.num_heads, dim_per_head),
-                float("NaN"),
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             ),
         )
 
     def increment_step(self, state: dict, increment: int = 1):
-        new_size = state["current_end"].shape[0] + increment
-        state["current_end"] = torch.zeros((new_size,)).to(state["current_end"].device)
+        state["current_end"] = state["current_end"] + increment
 
     def _complete_kv(self, k, v, state: dict | None):
         k, v = complete_kv(state["cache"], state["current_end"], k, v)
@@ -89,7 +84,7 @@ class StreamingMultiheadAttention(StatefulModule):
         return self.rope(query, key, offset=streaming_offset)
 
     def _streaming_offset(self, state: dict | None) -> torch.Tensor | int:
-        return state["current_end"].shape[0]
+        return state["current_end"]
 
     def check_model_state(self, model_state: dict):
         if model_state is None:
@@ -108,8 +103,8 @@ class StreamingMultiheadAttention(StatefulModule):
         q, k = self._apply_rope(q, k, state)
         k, v = self._complete_kv(k, v, state)
 
-        mask_shape = (query.shape[1], query.shape[1] + state["current_end"].shape[0])
-        shift = state["current_end"].shape[0]
+        mask_shape = (query.shape[1], query.shape[1] + state["current_end"])
+        shift = state["current_end"]
 
         attn_mask = self._get_mask(mask_shape, shift=shift, device=q.device)
 
